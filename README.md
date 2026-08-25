@@ -10,7 +10,7 @@ sudo ./tools.sh
 
 `A` / `all` 是保守的基础配置：创建目标用户、构建工具、cpupower/可选 performance governor、Redis、SSH、Go、Rust、Node.js 和 fail2ban。它不包含 UFW、防火墙规则重置、Redis RDB 恢复、sysctl 调优或 MySQL 安装；这些项目需要从菜单显式选择。
 
-构建工具模块包含 Ubuntu 官方仓库中的 `fzf`；旧机器再次执行 `A` 时，如果缺少 `fzf`，该模块会自动重新执行并补装。
+构建工具模块包含 `build-essential`、`pkg-config`、`clang`、`libclang-dev` 和 `fzf`；旧机器再次执行 `A` 时，如果缺少其中任一软件包，该模块会自动重新执行并补装。
 
 第一次执行 `A` 仍会询问用户名、密码策略和 SSH 公钥。默认版本为 Go `1.25.5`、Rust `1.98.0`、Node.js `24.19.0` 和 nvm `0.40.6`；可分别用 `GO_VERSION`、`RUST_VERSION`、`NODE_VERSION`、`NVM_VERSION` 覆盖。
 
