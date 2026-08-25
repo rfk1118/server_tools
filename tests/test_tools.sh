@@ -19,6 +19,9 @@ parse_selection A
 [[ " ${PARSED_MODULES[*]} " != *" restore_redis_rdb " ]]
 [[ " ${PARSED_MODULES[*]} " != *" configure_sysctl " ]]
 [[ " ${PARSED_MODULES[*]} " != *" install_mysql_free " ]]
+parse_selection 2
+map_output="$(sort_modules_by_dependencies "${PARSED_MODULES[@]}")"
+[[ "$map_output" == $'create_user\ninstall_build_tools' ]]
 parse_selection 10
 map_output="$(sort_modules_by_dependencies "${PARSED_MODULES[@]}")"
 [[ "$map_output" == $'create_user\ninstall_build_tools\ninstall_node' ]]

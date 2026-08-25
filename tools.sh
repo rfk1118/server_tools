@@ -41,6 +41,7 @@ should_skip_module() { [ "$1" = base ] && [ -f "$(marker_file "$2")" ] && module
 contains_module() { local needle="$1" item; shift; for item in "$@"; do [ "$item" = "$needle" ] && return 0; done; return 1; }
 module_dependencies() {
     case "$1" in
+        install_build_tools) printf '%s\n' create_user;;
         set_cpu_performance) printf '%s\n' install_cpupower;;
         configure_ssh) printf '%s\n' create_user install_build_tools;;
         restore_redis_rdb) printf '%s\n' install_redis;;
