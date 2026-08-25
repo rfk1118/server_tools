@@ -1,51 +1,39 @@
 #!/bin/bash
-
-# 安装 Rust 模块
-
 set -e
 
-echo ""
-echo "安装 Rust..."
-
-# 检查是否已经安装了 rust
-if command -v rustc &>/dev/null; then
-    echo "检测到 Rust 已安装:"
-    rustc --version
-    read -p "是否要重新安装? (y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo "跳过 Rust 安装"
-        exit 0
-    fi
+RUST_VERSION="${RUST_VERSION:-1.98.0}"
+[[ "$RUST_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "错误: RUST_VERSION 格式无效" >&2; exit 1; }
+target_user="${TARGET_USER:-}"
+target_home() { getent passwd "$target_user" | awk -F: '{print $6}'; }
+rust_profile_ready() {
+    local home profile
+    home=$(target_home); profile="$home/.bashrc"
+    [ ! -L "$profile" ] && grep -Fqx '. "$HOME/.cargo/env"' "$profile" 2>/dev/null
+}
+ensure_rust_profile() {
+    local home profile profile_line
+    home=$(target_home); profile="$home/.bashrc"; profile_line='. "$HOME/.cargo/env"'
+    [ ! -L "$profile" ] || { echo "错误: 拒绝写入符号链接形式的 $profile" >&2; return 1; }
+    runuser -u "$target_user" -- env HOME="$home" bash -c \
+        'touch "$HOME/.bashrc"; grep -Fqx "$1" "$HOME/.bashrc" || printf "%s\n" "$1" >> "$HOME/.bashrc"' _ "$profile_line"
+}
+has_rust_runtime() {
+    local home; home=$(target_home)
+    runuser -u "$target_user" -- env HOME="$home" "$home/.cargo/bin/rustc" --version 2>/dev/null | grep -q "rustc $RUST_VERSION "
+}
+has_rust() { has_rust_runtime && rust_profile_ready; }
+if [ "${1:-}" = --check ]; then id "$target_user" >/dev/null 2>&1 && has_rust; exit; fi
+id "$target_user" >/dev/null 2>&1 || { echo "错误: Rust 需要存在的 TARGET_USER" >&2; exit 1; }
+command -v curl >/dev/null || { echo "错误: Rust 安装需要 curl；请先运行 install_build_tools。" >&2; exit 1; }
+has_rust && { echo "用户 $target_user 已安装 Rust $RUST_VERSION，跳过。"; exit 0; }
+home=$(target_home)
+[ ! -L "$home/.bashrc" ] || { echo "错误: 拒绝写入符号链接形式的 $home/.bashrc" >&2; exit 1; }
+if has_rust_runtime; then
+    ensure_rust_profile
+    has_rust && { echo "用户 $target_user 的 Rust $RUST_VERSION 已安装，仅补齐 shell 配置。"; exit 0; }
 fi
-
-# 使用 rustup 安装 Rust
-echo "正在通过 rustup 安装 Rust..."
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-
-# 加载 Rust 环境变量
-source "$HOME/.cargo/env"
-
-# 如果设置了 TARGET_USER，也为该用户安装
-if [ -n "$TARGET_USER" ] && id "$TARGET_USER" &>/dev/null; then
-    user_home=$(eval echo ~$TARGET_USER)
-    
-    echo "为用户 $TARGET_USER 安装 Rust..."
-    # 切换到目标用户并安装
-    sudo -u "$TARGET_USER" bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" || {
-        echo "警告: 为用户 $TARGET_USER 安装 Rust 失败，但 root 用户安装成功"
-    }
-fi
-
-# 验证安装
-if command -v rustc &>/dev/null; then
-    echo ""
-    echo "Rust 安装成功！"
-    rustc --version
-    cargo --version
-    echo ""
-    echo "注意: 新终端会话中需要执行: source ~/.cargo/env"
-else
-    echo "警告: Rust 安装可能未成功，请检查"
-    exit 1
-fi
+runuser -u "$target_user" -- env HOME="$home" RUSTUP_HOME="$home/.rustup" CARGO_HOME="$home/.cargo" \
+    bash -o pipefail -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "$1"' _ "$RUST_VERSION"
+ensure_rust_profile
+has_rust || { echo "错误: Rust 安装验证失败" >&2; exit 1; }
+echo "Rust $RUST_VERSION 已为 $target_user 安装。"

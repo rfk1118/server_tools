@@ -4,6 +4,20 @@
 
 set -e
 
+find_mysql_conf() {
+    for file in /etc/mysql/mysql.conf.d/mysqld.cnf /etc/mysql/my.cnf; do
+        [ -f "$file" ] && { printf '%s\n' "$file"; return 0; }
+    done
+    return 1
+}
+
+if [ "${1:-}" = --check ]; then
+    MYSQL_CONF=$(find_mysql_conf) && command -v mysql >/dev/null 2>&1 && systemctl is-active --quiet mysql && \
+        systemctl is-enabled --quiet mysql && \
+        grep -qE '^[[:space:]]*bind-address[[:space:]]*=[[:space:]]*127\.0\.0\.1[[:space:]]*$' "$MYSQL_CONF" 2>/dev/null
+    exit
+fi
+
 echo ""
 echo "安装 MySQL (Community Server)..."
 
@@ -25,23 +39,26 @@ if [ "$MYSQL_INSTALLED" = true ]; then
     echo ""
     echo "配置 MySQL 仅允许本地访问..."
 
-    MYSQL_CONF=""
-    if [ -f "/etc/mysql/mysql.conf.d/mysqld.cnf" ]; then
-        MYSQL_CONF="/etc/mysql/mysql.conf.d/mysqld.cnf"
-    elif [ -f "/etc/mysql/my.cnf" ]; then
-        MYSQL_CONF="/etc/mysql/my.cnf"
-    fi
+    MYSQL_CONF=$(find_mysql_conf || true)
 
     if [ -n "$MYSQL_CONF" ]; then
         echo "找到 MySQL 配置文件: $MYSQL_CONF"
+
+        if systemctl is-active --quiet mysql && systemctl is-enabled --quiet mysql && \
+            grep -qE '^[[:space:]]*bind-address[[:space:]]*=[[:space:]]*127\.0\.0\.1[[:space:]]*$' "$MYSQL_CONF"; then
+            echo "MySQL 已仅监听本地地址，跳过。"
+            exit 0
+        fi
 
         if [ ! -f "${MYSQL_CONF}.bak" ]; then
             cp "$MYSQL_CONF" "${MYSQL_CONF}.bak"
             echo "已备份配置文件到: ${MYSQL_CONF}.bak"
         fi
+        CONFIG_BACKUP=$(mktemp)
+        cp -p "$MYSQL_CONF" "$CONFIG_BACKUP"
 
         if grep -qE "^[# ]*bind-address" "$MYSQL_CONF"; then
-            sed -i -E "s/^[# ]*bind-address\s*=.*/bind-address = 127.0.0.1/" "$MYSQL_CONF"
+            sed -i -E "s/^[# ]*bind-address[[:space:]]*=.*/bind-address = 127.0.0.1/" "$MYSQL_CONF"
         else
             if grep -q "^\[mysqld\]" "$MYSQL_CONF"; then
                 sed -i "/^\[mysqld\]/a bind-address = 127.0.0.1" "$MYSQL_CONF"
@@ -53,16 +70,19 @@ if [ "$MYSQL_INSTALLED" = true ]; then
         fi
 
         echo "重启 MySQL 服务以应用配置..."
-        systemctl restart mysql
-
-        if systemctl is-active --quiet mysql; then
+        if ! mysqld --validate-config >/dev/null 2>&1 || ! systemctl enable mysql || ! systemctl restart mysql || ! systemctl is-active --quiet mysql; then
+            cp -p "$CONFIG_BACKUP" "$MYSQL_CONF"
+            systemctl restart mysql || true
+            rm -f "$CONFIG_BACKUP"
+            echo "错误: MySQL 新配置无效或服务启动失败，已恢复旧配置" >&2
+            exit 1
+        else
+            rm -f "$CONFIG_BACKUP"
             echo "MySQL 服务运行正常"
             echo "仅监听本地地址: 127.0.0.1"
-        else
-            echo "警告: MySQL 服务可能未正常启动，请检查配置和日志"
-            systemctl status mysql --no-pager -l || true
         fi
     else
-        echo "警告: 未找到 MySQL 配置文件，请手动设置 bind-address = 127.0.0.1"
+        echo "错误: 未找到 MySQL 配置文件，请手动设置 bind-address = 127.0.0.1" >&2
+        exit 1
     fi
 fi

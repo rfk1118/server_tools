@@ -1,320 +1,153 @@
 #!/bin/bash
 
-# 服务器初始化脚本（适用于 Debian/Ubuntu 系统）
-# 提供菜单选择功能，支持自定义用户名
+# Ubuntu 24.04 server bootstrap menu. Modules remain independently runnable.
+# A is conservative: it excludes firewall changes, Redis restore, sysctl and MySQL.
 
-# 注意：不在脚本开头使用 set -e，因为我们希望某个模块失败时不影响其他模块
-
-# 获取脚本所在目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODULES_DIR="$SCRIPT_DIR/modules"
+STATE_DIR="${SERVER_TOOLS_STATE_DIR:-/var/lib/server_tools}"
+TARGET_USER_FILE="$SCRIPT_DIR/.target_user"
+BASE_PROFILE=(create_user install_build_tools install_cpupower set_cpu_performance install_redis configure_ssh install_golang install_rust install_node install_fail2ban)
+EXECUTION_ORDER=(create_user install_build_tools install_cpupower set_cpu_performance install_redis restore_redis_rdb configure_ssh configure_firewall install_golang install_rust install_node install_fail2ban configure_sysctl install_mysql_free)
 
-# 检查是否以 root 权限运行
-if [ "$EUID" -ne 0 ]; then 
-    echo "请以 root 权限运行此脚本: sudo $0"
-    exit 1
-fi
+read_target_user() { if [ -s "$TARGET_USER_FILE" ]; then head -n 1 "$TARGET_USER_FILE"; else printf '%s\n' four; fi; }
+configured_target_user() { [ -s "$TARGET_USER_FILE" ] && head -n 1 "$TARGET_USER_FILE"; }
+module_file() { printf '%s/%s.sh\n' "$MODULES_DIR" "$1"; }
+marker_file() { printf '%s/%s.success\n' "$STATE_DIR" "$1"; }
+module_is_current() { local file auto=0; file=$(module_file "$1"); [ "${2:-}" = base ] && auto=1; [ -f "$file" ] && TARGET_USER="$(read_target_user)" SERVER_TOOLS_AUTO="$auto" bash "$file" --check >/dev/null 2>&1; }
+prepare_state_dir() {
+    while [ "$STATE_DIR" != / ] && [[ "$STATE_DIR" == */ ]]; do STATE_DIR="${STATE_DIR%/}"; done
+    case "$STATE_DIR" in
+        ""|/|/var|/var/lib|/tmp|//*|*//*|*/../*|*/..|*/./*|*/.) return 1;;
+        /*) ;;
+        *) return 1;;
+    esac
+    [ ! -L "$STATE_DIR" ] || return 1
+    if [ ! -d "$STATE_DIR" ]; then
+        mkdir -p "$STATE_DIR" && chmod 0750 "$STATE_DIR" || return 1
+        [ "$EUID" -ne 0 ] || chown root:root "$STATE_DIR" || return 1
+    elif [ "$STATE_DIR" = /var/lib/server_tools ]; then
+        chmod 0750 "$STATE_DIR" && chown root:root "$STATE_DIR" || return 1
+    fi
+}
+mark_success() {
+    local tmp
+    prepare_state_dir || return 1
+    tmp=$(mktemp "$STATE_DIR/.${1}.XXXXXX") || return 1
+    chmod 0640 "$tmp" && mv -f "$tmp" "$(marker_file "$1")" || { rm -f "$tmp"; return 1; }
+}
+clear_success() { rm -f "$(marker_file "$1")"; }
+should_skip_module() { [ "$1" = base ] && [ -f "$(marker_file "$2")" ] && module_is_current "$2" "$1"; }
+contains_module() { local needle="$1" item; shift; for item in "$@"; do [ "$item" = "$needle" ] && return 0; done; return 1; }
+module_dependencies() {
+    case "$1" in
+        set_cpu_performance) printf '%s\n' install_cpupower;;
+        configure_ssh) printf '%s\n' create_user install_build_tools;;
+        restore_redis_rdb) printf '%s\n' install_redis;;
+        install_redis|install_node|install_rust) printf '%s\n' create_user install_build_tools;;
+        install_golang) printf '%s\n' install_build_tools;;
+    esac
+}
 
-# 检查 modules 目录是否存在
-if [ ! -d "$MODULES_DIR" ]; then
-    echo "错误: 找不到 modules 目录: $MODULES_DIR"
-    exit 1
-fi
-
-# 执行模块函数
-run_module() {
-    local module_name="$1"
-    local module_file="$MODULES_DIR/$module_name.sh"
-    
-    if [ ! -f "$module_file" ]; then
-        echo "错误: 找不到模块文件: $module_file"
-        return 1
-    fi
-    
-    # 确保模块脚本可执行
-    chmod +x "$module_file"
-    
-    # 读取用户名（如果文件存在），并传递给模块
-    local user_file="$SCRIPT_DIR/.target_user"
-    local target_user=""
-    if [ -f "$user_file" ]; then
-        target_user=$(cat "$user_file" | head -1)
-    fi
-    
-    # 执行模块脚本（传递环境变量 TARGET_USER）
-    if ! TARGET_USER="$target_user" bash "$module_file"; then
-        return 1
-    fi
-    
-    # 如果执行的是 create_user 模块，更新 TARGET_USER（从文件读取）
-    if [ "$module_name" = "create_user" ] && [ -f "$user_file" ]; then
-        TARGET_USER=$(cat "$user_file" | head -1)
-    fi
-    
+add_with_dependencies() {
+    local module="$1" dep
+    while IFS= read -r dep; do
+        [ -z "$dep" ] || add_with_dependencies "$dep"
+    done < <(module_dependencies "$module")
+    contains_module "$module" "${RESOLVED_MODULES[@]}" || RESOLVED_MODULES+=("$module")
+}
+sort_modules_by_dependencies() {
+    local module; RESOLVED_MODULES=()
+    for module in "$@"; do add_with_dependencies "$module"; done
+    for module in "${EXECUTION_ORDER[@]}"; do contains_module "$module" "${RESOLVED_MODULES[@]}" && printf '%s\n' "$module"; done
     return 0
 }
-
-# 读取用户名
-read_target_user() {
-    local user_file="$SCRIPT_DIR/.target_user"
-    if [ -f "$user_file" ]; then
-        cat "$user_file" | head -1
-    else
-        echo "four"  # 默认用户名
-    fi
-}
-
-# 显示菜单
-show_menu() {
-    clear
-    echo "=========================================="
-    echo "服务器初始化工具"
-    echo "=========================================="
-    echo ""
-    TARGET_USER=$(read_target_user)
-    echo "目标用户: $TARGET_USER (将在创建用户时设置或修改)"
-    echo ""
-    echo "请选择要执行的功能（可以多选，用空格分隔，例如: 1 2 3）:"
-    echo ""
-    echo "  [1] 创建用户并添加到 sudo 组"
-    echo "  [2] 安装构建相关软件 (build-essential, git, curl, vim 等)"
-    echo "  [3] 安装 cpupower 工具"
-    echo "  [4] 设置 CPU 模式为 performance"
-    echo "  [5] 安装 Redis (从官方仓库)"
-    echo "  [6] 配置 SSH (仅允许密钥登录)"
-    echo "  [7] 配置防火墙 (UFW)"
-    echo "  [8] 安装 Golang"
-    echo "  [9] 安装 Rust"
-    echo "  [10] 安装 Node.js (使用 nvm)"
-    echo "  [11] 安装 fail2ban (入侵防护)"
-    echo "  [12] 配置系统内核参数优化 (BSC节点优化)"
-    echo "  [13] 恢复 Redis RDB 文件"
-    echo "  [14] 安装 MySQL (Community Server，仅本地访问)"
-    echo ""
-    echo "  [A] 全部执行（按依赖顺序）"
-    echo "  [Q] 退出"
-    echo ""
-}
-
-
-# 解析用户选择
 parse_selection() {
-    local selection="$1"
-    local selected_modules=()
-    
-    # 将选择转换为小写并去除多余空格
-    selection=$(echo "$selection" | tr '[:upper:]' '[:lower:]' | tr -s ' ')
-    
-    # 处理全部执行
-    if [[ "$selection" == *"a"* ]] || [[ "$selection" == *"all"* ]]; then
-        selected_modules=("create_user" "install_build_tools" "install_cpupower" "set_cpu_performance" "install_redis" "configure_ssh" "configure_firewall" "install_golang" "install_rust" "install_node" "install_fail2ban" "install_mysql_free")
-        echo "${selected_modules[@]}"
-        return 0
-    fi
-    
-    # 解析数字选择
-    for num in $selection; do
-        case "$num" in
-            1) selected_modules+=("create_user") ;;
-            2) selected_modules+=("install_build_tools") ;;
-            3) selected_modules+=("install_cpupower") ;;
-            4) selected_modules+=("set_cpu_performance") ;;
-            5) selected_modules+=("install_redis") ;;
-            6) selected_modules+=("configure_ssh") ;;
-            7) selected_modules+=("configure_firewall") ;;
-            8) selected_modules+=("install_golang") ;;
-            9) selected_modules+=("install_rust") ;;
-            10) selected_modules+=("install_node") ;;
-            11) selected_modules+=("install_fail2ban") ;;
-            12) selected_modules+=("configure_sysctl") ;;
-            13) selected_modules+=("restore_redis_rdb") ;;
-            14) selected_modules+=("install_mysql_free") ;;
+    local selection="$1" token; PARSED_MODULES=(); PARSED_PROFILE=manual
+    selection=$(printf '%s' "$selection" | tr '[:upper:]' '[:lower:]')
+    read -r -a tokens <<< "$selection"
+    for token in "${tokens[@]}"; do
+        case "$token" in
+            a|all)
+                [ "${#tokens[@]}" -eq 1 ] || { echo "A/all 不能与其他选择混用" >&2; return 1; }
+                PARSED_MODULES=("${BASE_PROFILE[@]}"); PARSED_PROFILE=base; return 0 ;;
+            1) PARSED_MODULES+=(create_user);; 2) PARSED_MODULES+=(install_build_tools);; 3) PARSED_MODULES+=(install_cpupower);; 4) PARSED_MODULES+=(set_cpu_performance);;
+            5) PARSED_MODULES+=(install_redis);; 6) PARSED_MODULES+=(configure_ssh);; 7) PARSED_MODULES+=(configure_firewall);; 8) PARSED_MODULES+=(install_golang);;
+            9) PARSED_MODULES+=(install_rust);; 10) PARSED_MODULES+=(install_node);; 11) PARSED_MODULES+=(install_fail2ban);; 12) PARSED_MODULES+=(configure_sysctl);;
+            13) PARSED_MODULES+=(restore_redis_rdb);; 14) PARSED_MODULES+=(install_mysql_free);;
+            *) echo "无效选择: $token" >&2; return 1;;
         esac
     done
-    
-    echo "${selected_modules[@]}"
+    [ "${#PARSED_MODULES[@]}" -gt 0 ]
 }
+run_module() { local file user auto=0; file=$(module_file "$1"); user=$(configured_target_user || true); [ "${2:-}" = base ] && auto=1; [ -f "$file" ] || { echo "错误: 找不到模块: $1"; return 1; }; TARGET_USER="$user" SERVER_TOOLS_AUTO="$auto" bash "$file"; }
 
-# 按依赖顺序排序模块
-sort_modules_by_dependencies() {
-    local modules=("$@")
-    local sorted=()
-    local processed=()
-    
-    # 定义模块执行顺序（按依赖关系）
-    local execution_order=("create_user" "install_build_tools" "install_cpupower" "set_cpu_performance" "install_redis" "restore_redis_rdb" "configure_ssh" "configure_firewall" "install_golang" "install_rust" "install_node" "install_fail2ban" "configure_sysctl" "install_mysql_free")
-    
-    # 定义依赖关系：key 是模块名，value 是其依赖的模块
-    declare -A dependencies
-    dependencies["set_cpu_performance"]="install_cpupower"
-    dependencies["configure_ssh"]="create_user"
-    dependencies["restore_redis_rdb"]="install_redis"
-    
-    # 按照预定义的执行顺序，只添加用户选择的模块
-    for module in "${execution_order[@]}"; do
-        # 检查该模块是否在用户选择中
-        if [[ " ${modules[@]} " =~ " ${module} " ]]; then
-            # 检查依赖是否满足
-            local dep="${dependencies[$module]}"
-            if [ -n "$dep" ] && [[ " ${modules[@]} " =~ " ${dep} " ]]; then
-                # 如果依赖还未处理，先添加依赖
-                if [[ ! " ${processed[@]} " =~ " ${dep} " ]]; then
-                    sorted+=("$dep")
-                    processed+=("$dep")
-                fi
-            fi
-            # 添加当前模块
-            if [[ ! " ${processed[@]} " =~ " ${module} " ]]; then
-                sorted+=("$module")
-                processed+=("$module")
-            fi
-        fi
-    done
-    
-    # 添加未在预定义顺序中的模块（理论上不应该有）
-    for module in "${modules[@]}"; do
-        if [[ ! " ${processed[@]} " =~ " ${module} " ]]; then
-            sorted+=("$module")
-            processed+=("$module")
-        fi
-    done
-    
-    echo "${sorted[@]}"
-}
-
-# 执行选中的模块（按依赖顺序）
 execute_modules() {
-    local modules=("$@")
-    
-    if [ ${#modules[@]} -eq 0 ]; then
-        echo "未选择任何功能"
-        read -p "按回车键继续..."
-        return
-    fi
-    
-    # 按依赖顺序排序（只排序一次）
-    local sorted_modules=($(sort_modules_by_dependencies "${modules[@]}"))
-    
-    echo ""
-    echo "将按以下顺序执行（已考虑依赖关系）:"
-    local index=1
+    local profile="$1"; shift
+    local requested_modules=("$@") sorted_modules=() failed_modules=() module dep blocked_dep run_status failures=0 reply
+    while IFS= read -r module; do sorted_modules+=("$module"); done < <(sort_modules_by_dependencies "$@")
+    [ "${#sorted_modules[@]}" -gt 0 ] || { echo "未选择任何功能"; return 1; }
+    echo "将按以下顺序执行：${sorted_modules[*]}"
+    read -r -p "确认执行? (y/N): " reply
+    [[ "$reply" =~ ^[Yy]$ ]] || { echo "已取消"; return 0; }
     for module in "${sorted_modules[@]}"; do
-        echo "  [$index] $module"
-        ((index++))
-    done
-    echo ""
-    read -p "确认执行? (y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo "已取消"
-        read -p "按回车键继续..."
-        return
-    fi
-    
-    echo ""
-    echo "=========================================="
-    echo "开始执行..."
-    echo "=========================================="
-    echo ""
-    
-    # 执行模块
-    for module in "${sorted_modules[@]}"; do
-        # 检查依赖是否满足
-        case "$module" in
-            "set_cpu_performance")
-                # 检查是否安装了 cpupower（检查是否在当前执行列表中，或已安装）
-                local has_cpupower=false
-                if [[ " ${sorted_modules[@]} " =~ " install_cpupower " ]]; then
-                    has_cpupower=true
-                elif command -v cpupower &>/dev/null; then
-                    has_cpupower=true
-                fi
-                
-                if [ "$has_cpupower" = false ]; then
-                    echo ""
-                    echo "警告: set_cpu_performance 需要 install_cpupower，但未选择安装 cpupower 且系统中未找到 cpupower，跳过..."
-                    continue
-                fi
-                ;;
-            "configure_ssh")
-                # 检查用户是否存在（检查是否在当前执行列表中，或已存在）
-                local user_exists=false
-                if [[ " ${sorted_modules[@]} " =~ " create_user " ]]; then
-                    user_exists=true
-                elif [ -n "$TARGET_USER" ] && id "$TARGET_USER" &>/dev/null; then
-                    user_exists=true
-                fi
-                
-                if [ "$user_exists" = false ]; then
-                    echo ""
-                    echo "警告: configure_ssh 需要先创建用户，但未选择 create_user 且用户 $TARGET_USER 不存在，跳过..."
-                    continue
-                fi
-                ;;
-            "restore_redis_rdb")
-                # 检查 Redis 是否安装（检查是否在当前执行列表中，或已安装）
-                local redis_installed=false
-                if [[ " ${sorted_modules[@]} " =~ " install_redis " ]]; then
-                    redis_installed=true
-                elif command -v redis-server &>/dev/null; then
-                    redis_installed=true
-                fi
-                
-                if [ "$redis_installed" = false ]; then
-                    echo ""
-                    echo "警告: restore_redis_rdb 需要先安装 Redis，但未选择 install_redis 且系统中未找到 Redis，跳过..."
-                    continue
-                fi
-                ;;
-        esac
-        
-        echo ""
-        echo "----------------------------------------"
-        echo "执行模块: $module"
-        echo "----------------------------------------"
-        run_module "$module" || {
-            echo ""
-            echo "错误: 模块 $module 执行失败"
-            read -p "是否继续执行其他模块? (y/N): " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                echo "已停止执行"
-                break
-            fi
-        }
-    done
-    
-    echo ""
-    echo "=========================================="
-    echo "执行完成！"
-    echo "=========================================="
-    echo ""
-    read -p "按回车键继续..."
-}
-
-# 主循环
-main() {
-    while true; do
-        show_menu
-        read -p "请选择 (例如: 1 2 3 或 A): " selection
-        
-        if [ -z "$selection" ]; then
+        blocked_dep=""
+        while IFS= read -r dep; do
+            if [ -n "$dep" ] && contains_module "$dep" "${failed_modules[@]}"; then blocked_dep="$dep"; break; fi
+        done < <(module_dependencies "$module")
+        if [ -n "$blocked_dep" ]; then
+            clear_success "$module"
+            echo "错误: $module 的依赖 $blocked_dep 失败，未执行下游模块。" >&2
+            failed_modules+=("$module"); failures=$((failures + 1)); continue
+        fi
+        # Markers are only a cache: real module state always wins.
+        if should_skip_module "$profile" "$module"; then
+            echo "跳过 $module：上次成功且当前状态仍满足。"; continue
+        fi
+        if [ "$profile" = manual ] && ! contains_module "$module" "${requested_modules[@]}" && module_is_current "$module" "$profile"; then
+            echo "跳过依赖 $module：当前状态已满足。"; continue
+        fi
+        echo "---- 执行模块: $module ----"
+        if run_module "$module" "$profile"; then run_status=0; else run_status=$?; fi
+        if [ "$run_status" -eq 2 ]; then
+            clear_success "$module"
+            # A canceled prerequisite is incomplete, so its dependents must not run.
+            failed_modules+=("$module")
+            echo "$module 已由用户取消，未记录成功状态。"
             continue
         fi
-        
-        selection=$(echo "$selection" | tr '[:upper:]' '[:lower:]')
-        
-        # 处理特殊选项
-        if [[ "$selection" == "q" ]] || [[ "$selection" == "quit" ]] || [[ "$selection" == "exit" ]]; then
-            echo "退出"
-            exit 0
+        if [ "$run_status" -eq 0 ] && module_is_current "$module" "$profile"; then
+            if mark_success "$module"; then
+                echo "$module 完成。"
+            else
+                clear_success "$module"; failed_modules+=("$module"); echo "错误: 无法保存 $module 的成功状态。" >&2; failures=$((failures + 1))
+            fi
+        else
+            clear_success "$module"; failed_modules+=("$module"); echo "错误: 模块 $module 未成功完成。" >&2; failures=$((failures + 1))
         fi
-        
-        # 解析并执行选择
-        selected_modules=($(parse_selection "$selection"))
-        execute_modules "${selected_modules[@]}"
+    done
+    [ "$failures" -eq 0 ] || { echo "完成，但有 $failures 个模块失败。" >&2; return 1; }
+    echo "执行完成。"
+}
+show_menu() { cat <<'EOF'
+==========================================
+服务器初始化工具
+  [1] 用户 [2] 构建工具 [3] cpupower [4] CPU performance
+  [5] Redis [6] SSH [7] UFW [8] Go [9] Rust [10] Node.js
+  [11] fail2ban [12] sysctl [13] 恢复 Redis RDB（破坏性）[14] MySQL
+  [A] Ubuntu 基础配置（不含 UFW/RDB 恢复/sysctl/MySQL）
+  [Q] 退出
+EOF
+}
+main() {
+    [ "$EUID" -eq 0 ] || { echo "请以 root 运行: sudo $0"; exit 1; }
+    [ -d "$MODULES_DIR" ] || { echo "错误: 找不到 modules 目录"; exit 1; }
+    while true; do
+        show_menu; printf '目标用户: %s\n' "$(read_target_user)"; read -r -p "请选择: " selection
+        case "${selection,,}" in q|quit|exit) return 0;; esac
+        if parse_selection "$selection"; then
+            execute_modules "$PARSED_PROFILE" "${PARSED_MODULES[@]}" || return 1
+        fi
     done
 }
-
-# 运行主程序
-main
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

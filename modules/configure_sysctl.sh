@@ -30,10 +30,18 @@ declare -A SYSCTL_PARAMS=(
     ["vm.dirty_background_ratio"]="5"
 )
 
+if [ "${1:-}" = "--check" ]; then
+    for param in "${!SYSCTL_PARAMS[@]}"; do
+        [ "$(sysctl -n "$param" 2>/dev/null || true)" = "${SYSCTL_PARAMS[$param]}" ] || exit 1
+    done
+    exit 0
+fi
+
 # 配置文件路径
 SYSCTL_CONF="/etc/sysctl.conf"
 SYSCTL_D_DIR="/etc/sysctl.d"
 SYSCTL_D_CONF="$SYSCTL_D_DIR/99-bsc-optimization.conf"
+CONFIG_FILE=""
 
 # 检查并设置参数到配置文件
 set_sysctl_param() {
@@ -43,8 +51,12 @@ set_sysctl_param() {
     
     # 转义特殊字符用于 sed
     local escaped_param=$(echo "$param" | sed 's/\./\\./g')
-    local escaped_value=$(echo "$value" | sed 's/\./\\./g')
     
+    # 已经是期望值时不要产生无谓写入。
+    if grep -qE "^[[:space:]]*${escaped_param}[[:space:]]*=[[:space:]]*${value}[[:space:]]*$" "$config_file" 2>/dev/null; then
+        echo "  保持: $param = $value"
+        return
+    fi
     # 检查参数是否已存在（支持注释和空行）
     if grep -qE "^[[:space:]]*${escaped_param}[[:space:]]*=" "$config_file" 2>/dev/null; then
         # 参数已存在，修改它
@@ -55,20 +67,6 @@ set_sysctl_param() {
         # 参数不存在，追加到文件末尾
         echo "$param = $value" >> "$config_file"
         echo "  新增: $param = $value"
-    fi
-}
-
-# 应用单个参数（立即生效）
-apply_sysctl_param() {
-    local param="$1"
-    local value="$2"
-    
-    # 检查参数是否可写
-    if sysctl -w "$param=$value" > /dev/null 2>&1; then
-        return 0
-    else
-        echo "  警告: 无法立即应用 $param，可能需要重启后生效"
-        return 1
     fi
 }
 
@@ -85,6 +83,7 @@ select_config_file() {
 # 主配置函数
 configure_sysctl() {
     local config_file=$(select_config_file)
+    CONFIG_FILE="$config_file"
     
     # 确保配置文件存在
     if [ ! -f "$config_file" ]; then
@@ -120,23 +119,21 @@ configure_sysctl() {
 
 # 应用配置（立即生效）
 apply_sysctl() {
+    local apply_command=()
     echo ""
-    echo "应用配置（立即生效）..."
-    
-    local success_count=0
-    local fail_count=0
-    
-    for param in "${!SYSCTL_PARAMS[@]}"; do
-        value="${SYSCTL_PARAMS[$param]}"
-        if apply_sysctl_param "$param" "$value"; then
-            ((success_count++))
-        else
-            ((fail_count++))
-        fi
-    done
-    
-    echo ""
-    echo "应用完成: 成功 $success_count 个，失败 $fail_count 个"
+    if [ "$CONFIG_FILE" = "$SYSCTL_D_CONF" ]; then
+        echo "使用 sysctl --system 应用 /etc/sysctl.d 配置..."
+        apply_command=(sysctl --system)
+    else
+        echo "使用 sysctl -p 明确应用 $CONFIG_FILE ..."
+        apply_command=(sysctl -p "$CONFIG_FILE")
+    fi
+    if "${apply_command[@]}"; then
+        echo "配置已应用"
+    else
+        echo "错误: sysctl 配置应用失败，请检查上方输出。" >&2
+        return 1
+    fi
     
     # 检查 BBR 是否可用
     if [ -f /proc/sys/net/ipv4/tcp_congestion_control ]; then
@@ -212,26 +209,15 @@ main() {
     read -p "是否立即应用配置? (y/N): " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        apply_sysctl
-        
-        # 如果使用 /etc/sysctl.d/，尝试通过 systemd-sysctl 重新加载
-        if [[ "$config_file" == "$SYSCTL_D_CONF" ]] && systemctl is-active systemd-sysctl &>/dev/null; then
-            echo ""
-            echo "通过 systemd-sysctl 重新加载配置..."
-            if systemctl restart systemd-sysctl &>/dev/null; then
-                echo "配置已通过 systemd-sysctl 重新加载"
-            else
-                echo "注意: systemd-sysctl 重新加载失败，但配置已直接应用"
-            fi
-        fi
+        apply_sysctl || exit 1
     else
         echo "配置已保存到文件"
-        if [[ "$config_file" == "$SYSCTL_D_CONF" ]]; then
+        if [[ "$CONFIG_FILE" == "$SYSCTL_D_CONF" ]]; then
             echo "  - 重启后会自动生效（systemd 会自动加载 /etc/sysctl.d/ 目录下的配置）"
-            echo "  - 或手动运行: systemctl restart systemd-sysctl"
+            echo "  - 或手动运行: sysctl --system"
         else
             echo "  - 重启后会自动生效"
-            echo "  - 或手动运行: sysctl -p $config_file"
+            echo "  - 或手动运行: sysctl -p $CONFIG_FILE"
         fi
     fi
     
@@ -241,14 +227,13 @@ main() {
     echo ""
     echo "系统内核参数配置完成"
     echo ""
-    local config_file=$(select_config_file)
+    local config_file="$CONFIG_FILE"
     echo "提示:"
     echo "  - 配置文件位置: $config_file"
     if [[ "$config_file" == "$SYSCTL_D_CONF" ]]; then
         echo "  - 重启后自动生效: systemd 会在启动时自动加载 /etc/sysctl.d/ 目录下的配置"
         echo "  - 手动应用配置（无需重启）:"
-        echo "    * systemctl restart systemd-sysctl"
-        echo "    * 或: sysctl -p $config_file"
+        echo "    * sysctl --system"
     else
         echo "  - 重启后自动生效"
         echo "  - 手动应用配置: sysctl -p $config_file"

@@ -1,149 +1,120 @@
 #!/bin/bash
-
-# 配置 SSH 模块
-# 先提示用户输入 SSH key，如果未输入则跳过整个配置
-
 set -e
 
-echo ""
-echo "配置 SSH..."
-echo ""
-echo "请先输入用于登录的 SSH 公钥内容:"
-echo "提示: 可以从本地执行 'cat ~/.ssh/id_rsa.pub' 或 'cat ~/.ssh/id_ed25519.pub' 获取公钥内容"
-echo "示例: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC... user@hostname"
-echo ""
-echo "说明: 支持单行或多行输入"
-echo "      - 直接按回车: 跳过 SSH 配置"
-echo "      - 输入公钥内容后按回车，然后在下一行输入 END 结束"
-echo ""
-read -p "请粘贴 SSH 公钥（或直接按回车跳过）: " -r first_line
-
-# 如果第一行直接是空（用户直接按回车），则跳过
-if [ -z "$first_line" ]; then
-    echo ""
-    echo "未输入 SSH 公钥，跳过 SSH 配置"
-    exit 0
+DROPIN_DIR=/etc/ssh/sshd_config.d
+DROPIN="$DROPIN_DIR/00-server-tools.conf"
+target_user="${TARGET_USER:-}"
+if [ -z "$target_user" ]; then
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    target_user=$(head -n 1 "$script_dir/../.target_user" 2>/dev/null || true)
 fi
-
-SSH_KEY="$first_line"
-
-# 继续读取多行，直到输入 END
-while IFS= read -r line; do
-    if [ "$line" = "END" ]; then
-        break
-    fi
-    if [ -n "$line" ]; then
-        SSH_KEY="${SSH_KEY}
-${line}"
-    fi
-done
-
-# 清理首尾空白
-SSH_KEY=$(echo "$SSH_KEY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-
-if [ -z "$SSH_KEY" ]; then
-    echo ""
-    echo "未输入 SSH 公钥，跳过 SSH 配置"
-    exit 0
-fi
-
-# 如果输入了 SSH key，则继续配置 SSH
-SSH_CONFIG="/etc/ssh/sshd_config"
-SSH_CONFIG_BACKUP="/etc/ssh/sshd_config.backup.$(date +%Y%m%d_%H%M%S)"
-
-# 备份原始配置
-cp "$SSH_CONFIG" "$SSH_CONFIG_BACKUP"
-echo "已备份 SSH 配置到: $SSH_CONFIG_BACKUP"
-
-# 删除 /etc/ssh/ssh_config.d/ 中的配置文件
-echo ""
-echo "删除 /etc/ssh/ssh_config.d/ 中的配置文件..."
-if [ -d "/etc/ssh/ssh_config.d" ]; then
-    SSH_CONFIG_D_COUNT=$(find /etc/ssh/ssh_config.d -type f 2>/dev/null | wc -l)
-    if [ "$SSH_CONFIG_D_COUNT" -gt 0 ]; then
-        rm -f /etc/ssh/ssh_config.d/*
-        echo "已删除 $SSH_CONFIG_D_COUNT 个配置文件"
+user_home() { getent passwd "$1" | awk -F: '{print $6}'; }
+sshd_setting() { sshd -T 2>/dev/null | awk -v key="$1" '$1 == key {print $2; exit}'; }
+ssh_hardened() {
+    [ "$(sshd_setting pubkeyauthentication)" = yes ] && [ "$(sshd_setting passwordauthentication)" = no ] &&
+        [ "$(sshd_setting kbdinteractiveauthentication)" = no ] && [ "$(sshd_setting permitrootlogin)" = no ]
+}
+sshd_active() {
+    systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.service 2>/dev/null ||
+        systemctl is-active --quiet sshd.service 2>/dev/null
+}
+key_content_valid() {
+    local home keys
+    home=$(user_home "$target_user") || return 1
+    keys="$home/.ssh/authorized_keys"
+    [ ! -L "$home/.ssh" ] && [ ! -L "$keys" ] && [ -s "$keys" ] && ssh-keygen -lf "$keys" >/dev/null 2>&1
+}
+has_key() {
+    local home keys
+    home=$(user_home "$target_user") || return 1
+    keys="$home/.ssh/authorized_keys"
+    key_content_valid &&
+        [ "$(stat -c %a "$home/.ssh" 2>/dev/null)" = 700 ] && [ "$(stat -c %a "$keys" 2>/dev/null)" = 600 ] &&
+        [ "$(stat -c %U "$home/.ssh" 2>/dev/null)" = "$target_user" ] && [ "$(stat -c %U "$keys" 2>/dev/null)" = "$target_user" ]
+}
+reload_sshd() {
+    if systemctl list-unit-files --type=socket | grep -q '^ssh\.socket'; then
+        systemctl reload ssh.service 2>/dev/null || systemctl restart ssh.service
+    elif systemctl list-unit-files --type=service | grep -q '^sshd\.service'; then
+        systemctl reload sshd.service
+    elif systemctl list-unit-files --type=service | grep -q '^ssh\.service'; then
+        systemctl reload ssh.service
     else
-        echo "/etc/ssh/ssh_config.d/ 目录为空，无需删除"
+        return 1
     fi
+}
+if [ "${1:-}" = --check ]; then
+    id "$target_user" >/dev/null 2>&1 && ssh_hardened && has_key && sshd_active
+    exit
+fi
+
+id "$target_user" >/dev/null 2>&1 || { echo "错误: 目标用户不存在: $target_user" >&2; exit 1; }
+if ! command -v sshd >/dev/null; then
+    echo "未找到 sshd，安装 openssh-server。"
+    apt-get update
+    apt-get install -y openssh-server
+fi
+command -v sshd >/dev/null || { echo "错误: openssh-server 安装后仍未找到 sshd" >&2; exit 1; }
+if ! systemctl list-unit-files --type=socket | grep -q '^ssh\.socket' && ! systemctl list-unit-files --type=service | grep -qE '^(ssh|sshd)\.service'; then
+    echo "错误: 未找到 ssh/sshd 服务。" >&2; exit 1
+fi
+home=$(user_home "$target_user")
+ssh_dir="$home/.ssh"; keys="$ssh_dir/authorized_keys"
+target_group=$(id -gn "$target_user")
+[ ! -L "$ssh_dir" ] && [ ! -L "$keys" ] || { echo "错误: 拒绝写入符号链接形式的 .ssh 或 authorized_keys。" >&2; exit 1; }
+if key_content_valid; then
+    chmod 700 "$ssh_dir"; chown "$target_user:$target_group" "$ssh_dir"
+    chmod 600 "$keys"; chown "$target_user:$target_group" "$keys"
+fi
+if [ "${SERVER_TOOLS_AUTO:-0}" = 1 ] && ssh_hardened && has_key && sshd_active; then
+    echo "SSH 加固和 $target_user 的公钥已满足，跳过。"; exit 0
+fi
+ssh_key=""
+if [ "${SERVER_TOOLS_AUTO:-0}" = 1 ] && key_content_valid; then
+    echo "复用 $target_user 已有的有效 authorized_keys。"
+elif has_key; then
+    printf '请粘贴要追加给 %s 的单行 SSH 公钥（留空取消）: ' "$target_user"
 else
-    echo "/etc/ssh/ssh_config.d/ 目录不存在，跳过"
+    printf '请粘贴 %s 的单行 SSH 公钥（留空取消）: ' "$target_user"
 fi
-
-# 修改 SSH 配置
-sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' "$SSH_CONFIG"
-sed -i 's/PubkeyAuthentication no/PubkeyAuthentication yes/' "$SSH_CONFIG"
-
-# 如果不存在则添加配置
-if ! grep -q "^PubkeyAuthentication" "$SSH_CONFIG"; then
-    echo "PubkeyAuthentication yes" >> "$SSH_CONFIG"
-fi
-
-# 禁用密码认证
-sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' "$SSH_CONFIG"
-sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' "$SSH_CONFIG"
-
-if ! grep -q "^PasswordAuthentication" "$SSH_CONFIG"; then
-    echo "PasswordAuthentication no" >> "$SSH_CONFIG"
-fi
-
-# 确保 PermitRootLogin 配置（可选，建议禁用 root 登录）
-if ! grep -q "^PermitRootLogin" "$SSH_CONFIG"; then
-    echo "PermitRootLogin no" >> "$SSH_CONFIG"
-fi
-
-echo ""
-echo "SSH 配置已更新:"
-echo "  - PubkeyAuthentication: yes"
-echo "  - PasswordAuthentication: no"
-
-# 设置用户的 SSH 目录和公钥
-# 优先使用环境变量 TARGET_USER，其次从文件读取，最后使用默认值 four
-if [ -z "$TARGET_USER" ]; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    TARGET_USER_FILE="$SCRIPT_DIR/../.target_user"
-    if [ -f "$TARGET_USER_FILE" ]; then
-        TARGET_USER=$(cat "$TARGET_USER_FILE" 2>/dev/null | head -1)
+if [ "${SERVER_TOOLS_AUTO:-0}" != 1 ] || ! key_content_valid; then
+    IFS= read -r ssh_key
+    if [ -z "$ssh_key" ]; then
+        echo "未提供公钥，未修改 SSH 配置。"
+        [ "${SERVER_TOOLS_AUTO:-0}" = 1 ] && exit 1 || exit 2
     fi
-    # 如果文件不存在或为空，使用默认值
-    if [ -z "$TARGET_USER" ]; then
-        TARGET_USER="four"
-    fi
+    printf '%s\n' "$ssh_key" | ssh-keygen -lf - >/dev/null 2>&1 || { echo "错误: 无效 SSH 公钥" >&2; exit 1; }
+fi
+mkdir -p "$ssh_dir"; chmod 700 "$ssh_dir"; chown "$target_user:$target_group" "$ssh_dir"
+touch "$keys"; chmod 600 "$keys"; chown "$target_user:$target_group" "$keys"
+if [ -n "$ssh_key" ] && ! grep -Fqx -- "$ssh_key" "$keys"; then
+    printf '%s\n' "$ssh_key" >> "$keys"
 fi
 
-if id "$TARGET_USER" &>/dev/null; then
-    echo ""
-    echo "配置 $TARGET_USER 用户的 SSH 公钥..."
-    mkdir -p "/home/$TARGET_USER/.ssh"
-    chmod 700 "/home/$TARGET_USER/.ssh"
-    chown "$TARGET_USER:$TARGET_USER" "/home/$TARGET_USER/.ssh"
-    echo "$SSH_KEY" > "/home/$TARGET_USER/.ssh/authorized_keys"
-    chmod 600 "/home/$TARGET_USER/.ssh/authorized_keys"
-    chown "$TARGET_USER:$TARGET_USER" "/home/$TARGET_USER/.ssh/authorized_keys"
-    echo "SSH 公钥已保存到 /home/$TARGET_USER/.ssh/authorized_keys"
-else
-    echo ""
-    echo "警告: 用户 $TARGET_USER 不存在，跳过该用户的 SSH 公钥配置"
+mkdir -p "$DROPIN_DIR"
+previous=$(mktemp)
+if [ -f "$DROPIN" ]; then cp "$DROPIN" "$previous"; else : > "$previous"; fi
+cat > "$DROPIN" <<'EOF'
+# Managed by server_tools. Ubuntu 24.04 reads sshd_config.d drop-ins.
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+EOF
+chmod 644 "$DROPIN"
+if ! sshd -t || ! ssh_hardened; then
+    if [ -s "$previous" ]; then cp "$previous" "$DROPIN"; else rm -f "$DROPIN"; fi
+    rm -f "$previous"
+    echo "错误: sshd 配置验证失败或未达到预期，已回滚 drop-in。" >&2
+    exit 1
 fi
-
-# 设置 root 用户的 SSH 目录和公钥
-echo ""
-echo "配置 root 用户的 SSH 公钥..."
-mkdir -p /root/.ssh
-chmod 700 /root/.ssh
-echo "$SSH_KEY" > /root/.ssh/authorized_keys
-chmod 600 /root/.ssh/authorized_keys
-echo "SSH 公钥已保存到 /root/.ssh/authorized_keys"
-
-echo ""
-read -p "是否现在重启 SSH 服务? (y/N): " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    systemctl restart sshd
-    echo "SSH 服务已重启"
-else
-    echo "请稍后手动重启 SSH 服务: systemctl restart sshd"
+if ! reload_sshd; then
+    if [ -s "$previous" ]; then cp "$previous" "$DROPIN"; else rm -f "$DROPIN"; fi
+    sshd -t || true
+    reload_sshd || true
+    rm -f "$previous"
+    echo "错误: SSH 服务未能重载，已恢复旧 drop-in 并尝试恢复服务。" >&2
+    exit 1
 fi
-
-echo "SSH 配置模块完成"
-
+rm -f "$previous"
+echo "SSH 已配置为仅允许目标用户的公钥登录；未写入 root 公钥。"

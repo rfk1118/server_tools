@@ -1,166 +1,95 @@
 #!/bin/bash
-
-# 安装 Redis 模块
-
 set -e
 
-echo ""
-echo "安装 Redis..."
-REDIS_INSTALLED=false
-if command -v redis-server &> /dev/null; then
-    echo "Redis 已安装，版本: $(redis-server --version)"
-    REDIS_INSTALLED=true
-else
-    echo "配置 Redis 官方仓库..."
-    
-    # 下载并添加 Redis GPG 密钥
-    curl -fsSL https://packages.redis.io/gpg | gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
-    chmod 644 /usr/share/keyrings/redis-archive-keyring.gpg
-    
-    # 添加 Redis 仓库
-    echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/redis.list
-    
-    # 更新软件包列表并安装 Redis
+SOCKET_PATH=/var/run/redis/redis-server.sock
+target_user="${TARGET_USER:-}"
+key_tmp=""; keyring_tmp=""; conf_backup=""; conf=""; config_pending=0
+cleanup() {
+    [ -z "$key_tmp" ] || rm -f "$key_tmp"
+    [ -z "$keyring_tmp" ] || rm -f "$keyring_tmp"
+    if [ "$config_pending" -eq 1 ] && [ -n "$conf_backup" ] && [ -n "$conf" ]; then cp -p "$conf_backup" "$conf"; fi
+    [ -z "$conf_backup" ] || rm -f "$conf_backup"
+}
+trap cleanup EXIT
+find_conf() { for f in /etc/redis/redis.conf /etc/redis-server.conf /etc/redis.conf; do [ -f "$f" ] && { printf '%s\n' "$f"; return; }; done; return 1; }
+conf_value() { awk -v key="$2" '$1 == key {print $2; exit}' "$1"; }
+set_port() {
+    local value="$1"
+    if grep -qE '^[[:space:]]*#?[[:space:]]*port[[:space:]]+' "$conf"; then
+        sed -i -E "s|^[[:space:]]*#?[[:space:]]*port[[:space:]]+.*|port $value|" "$conf"
+    else
+        printf '\nport %s\n' "$value" >> "$conf"
+    fi
+}
+redis_ping() {
+    if [ -S "$SOCKET_PATH" ]; then
+        if [ -n "$target_user" ] && id "$target_user" >/dev/null 2>&1; then runuser -u "$target_user" -- redis-cli -s "$SOCKET_PATH" ping 2>/dev/null | grep -qx PONG
+        else redis-cli -s "$SOCKET_PATH" ping 2>/dev/null | grep -qx PONG; fi
+    else redis-cli -h 127.0.0.1 -p 6379 ping 2>/dev/null | grep -qx PONG; fi
+}
+socket_ready() {
+    local conf
+    conf=$(find_conf) || return 1
+    [ "$(conf_value "$conf" port)" = 0 ] && [ "$(conf_value "$conf" unixsocket)" = "$SOCKET_PATH" ] &&
+        [ "$(conf_value "$conf" unixsocketperm)" = 770 ] && [ -S "$SOCKET_PATH" ] &&
+        [ "$(stat -c %a "$SOCKET_PATH" 2>/dev/null)" = 770 ] &&
+        id -nG "$target_user" | tr ' ' '\n' | grep -qx redis && redis_ping
+}
+if [ "${1:-}" = --check ]; then
+    command -v redis-server >/dev/null && systemctl is-enabled --quiet redis-server &&
+        systemctl is-active --quiet redis-server && redis_ping || exit 1
+    if [ "${SERVER_TOOLS_AUTO:-0}" = 1 ]; then
+        socket_ready || exit 1
+    fi
+    exit
+fi
+
+if ! command -v redis-server >/dev/null; then
+    command -v curl >/dev/null && command -v gpg >/dev/null || { echo "错误: Redis 安装需要 curl 和 gpg；请先运行 install_build_tools。" >&2; exit 1; }
     apt-get update
-    apt-get install -y redis
-    
-    # 启用并启动 Redis 服务
-    systemctl enable redis-server
-    systemctl start redis-server
-    echo "Redis 安装完成"
-    REDIS_INSTALLED=true
+    key_tmp=$(mktemp); keyring_tmp=$(mktemp)
+    curl -fsSL https://packages.redis.io/gpg -o "$key_tmp"
+    gpg --batch --yes --dearmor -o "$keyring_tmp" "$key_tmp"
+    install -m 644 "$keyring_tmp" /usr/share/keyrings/redis-archive-keyring.gpg
+    . /etc/os-release
+    printf 'deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb %s main\n' "$VERSION_CODENAME" > /etc/apt/sources.list.d/redis.list
+    apt-get update; apt-get install -y redis
 fi
+systemctl enable --now redis-server
+conf=$(find_conf) || { echo "错误: 未找到 Redis 配置文件" >&2; exit 1; }
 
-# 配置 Redis 连接方式
-if [ "$REDIS_INSTALLED" = true ]; then
-    echo ""
-    echo "配置 Redis 连接方式..."
-    read -p "是否使用 Unix Domain Socket 而不是 HTTP 连接? (Y/n): " -n 1 -r
-    echo
-    USE_UNIX_SOCKET=true
-    if [[ $REPLY =~ ^[Nn]$ ]]; then
-        USE_UNIX_SOCKET=false
-        echo "将使用 TCP 连接（默认端口 6379）"
-    else
-        echo "将使用 Unix Domain Socket 连接"
-    fi
-    
-    # 查找 Redis 配置文件
-    REDIS_CONF=""
-    if [ -f "/etc/redis/redis.conf" ]; then
-        REDIS_CONF="/etc/redis/redis.conf"
-    elif [ -f "/etc/redis-server.conf" ]; then
-        REDIS_CONF="/etc/redis-server.conf"
-    elif [ -f "/etc/redis.conf" ]; then
-        REDIS_CONF="/etc/redis.conf"
-    fi
-    
-    if [ -n "$REDIS_CONF" ]; then
-        echo "找到 Redis 配置文件: $REDIS_CONF"
-        
-        # 备份配置文件
-        if [ ! -f "${REDIS_CONF}.bak" ]; then
-            cp "$REDIS_CONF" "${REDIS_CONF}.bak"
-            echo "已备份配置文件到: ${REDIS_CONF}.bak"
-        fi
-        
-        if [ "$USE_UNIX_SOCKET" = true ]; then
-            # 配置使用 Unix Domain Socket
-            SOCKET_PATH="/var/run/redis/redis-server.sock"
-            SOCKET_DIR=$(dirname "$SOCKET_PATH")
-            
-            # 创建 socket 目录
-            mkdir -p "$SOCKET_DIR"
-            
-            # 配置 socket 路径
-            if grep -q "^unixsocket " "$REDIS_CONF"; then
-                # 如果已存在 unixsocket 配置，则修改它
-                sed -i "s|^unixsocket .*|unixsocket $SOCKET_PATH|" "$REDIS_CONF"
-            else
-                # 如果不存在，则添加配置
-                # 找到 port 配置行，在其后添加 unixsocket 配置
-                if grep -q "^port " "$REDIS_CONF"; then
-                    sed -i "/^port /a unixsocket $SOCKET_PATH" "$REDIS_CONF"
-                else
-                    echo "unixsocket $SOCKET_PATH" >> "$REDIS_CONF"
-                fi
-            fi
-            
-            # 启用 unixsocket
-            if grep -q "^unixsocketperm " "$REDIS_CONF"; then
-                sed -i "s|^unixsocketperm .*|unixsocketperm 770|" "$REDIS_CONF"
-            else
-                # 在 unixsocket 配置后添加 unixsocketperm
-                sed -i "/^unixsocket /a unixsocketperm 770" "$REDIS_CONF"
-            fi
-            
-            # 可选：禁用 TCP 监听（注释掉 port 配置）
-            read -p "是否禁用 TCP 连接（仅使用 Unix Socket）? (y/N): " -n 1 -r
-            echo
-            if [[ $REPLY =~ ^[Yy]$ ]]; then
-                if grep -q "^port " "$REDIS_CONF"; then
-                    sed -i "s/^port /#port /" "$REDIS_CONF"
-                    echo "已禁用 TCP 端口监听"
-                fi
-            fi
-            
-            echo "已配置 Unix Domain Socket: $SOCKET_PATH"
-            echo "Socket 权限: 770"
-            
-            # 将当前用户添加到 redis 组
-            if getent group redis > /dev/null 2>&1; then
-                CURRENT_USER=$(whoami)
-                if ! groups "$CURRENT_USER" | grep -q "\bredis\b"; then
-                    echo ""
-                    echo "将用户 $CURRENT_USER 添加到 redis 组..."
-                    usermod -aG redis "$CURRENT_USER"
-                    echo "用户 $CURRENT_USER 已添加到 redis 组"
-                    echo "注意: 需要重新登录或使用 'newgrp redis' 才能使组权限生效"
-                else
-                    echo "用户 $CURRENT_USER 已在 redis 组中"
-                fi
-            else
-                echo "警告: redis 组不存在，请检查 Redis 安装"
-            fi
-            
-        else
-            # 确保使用 TCP 连接（取消注释 port，禁用 unixsocket）
-            if grep -q "^#port " "$REDIS_CONF"; then
-                sed -i "s/^#port /port /" "$REDIS_CONF"
-            fi
-            
-            if grep -q "^unixsocket " "$REDIS_CONF"; then
-                sed -i "s/^unixsocket /#unixsocket /" "$REDIS_CONF"
-            fi
-            
-            echo "已配置为使用 TCP 连接（端口 6379）"
-        fi
-        
-        # 重启 Redis 服务以应用配置
-        echo ""
-        echo "重启 Redis 服务以应用配置..."
-        systemctl restart redis-server
-        
-        # 验证配置
-        sleep 1
-        if systemctl is-active --quiet redis-server; then
-            echo "Redis 服务运行正常"
-            if [ "$USE_UNIX_SOCKET" = true ]; then
-                echo "Unix Socket 路径: $SOCKET_PATH"
-                if [ -S "$SOCKET_PATH" ]; then
-                    echo "Socket 文件已创建"
-                else
-                    echo "警告: Socket 文件未找到，请检查配置"
-                fi
-            else
-                echo "TCP 端口: 6379"
-            fi
-        else
-            echo "警告: Redis 服务可能未正常启动，请检查配置和日志"
-            systemctl status redis-server --no-pager -l || true
-        fi
-    else
-        echo "警告: 未找到 Redis 配置文件，请手动配置"
-    fi
+if [ "${SERVER_TOOLS_AUTO:-0}" = 1 ]; then mode=socket
+else
+    read -r -p "使用 Unix socket（更适合本机服务）? (Y/n): " answer
+    [ "${answer:-Y}" = n ] || [ "${answer:-Y}" = N ] && mode=tcp || mode=socket
 fi
-
+conf_backup=$(mktemp)
+cp -p "$conf" "$conf_backup"
+config_pending=1
+if [ "$mode" = socket ]; then
+    [ -n "$target_user" ] && id "$target_user" >/dev/null 2>&1 || { echo "错误: Unix socket 模式需要存在的 TARGET_USER。" >&2; exit 1; }
+    mkdir -p "$(dirname "$SOCKET_PATH")"
+    set_port 0
+    grep -qE '^[[:space:]]*unixsocket[[:space:]]+' "$conf" && sed -i -E "s|^[[:space:]]*unixsocket[[:space:]]+.*|unixsocket $SOCKET_PATH|" "$conf" || printf '\nunixsocket %s\n' "$SOCKET_PATH" >> "$conf"
+    grep -qE '^[[:space:]]*unixsocketperm[[:space:]]+' "$conf" && sed -i -E 's|^[[:space:]]*unixsocketperm[[:space:]]+.*|unixsocketperm 770|' "$conf" || printf 'unixsocketperm 770\n' >> "$conf"
+    getent group redis >/dev/null || { echo "错误: Redis 组不存在。" >&2; exit 1; }
+    usermod -aG redis "$target_user"
+else
+    set_port 6379
+    sed -i -E 's|^[[:space:]]*unixsocket[[:space:]]+|# unixsocket |; s|^[[:space:]]*unixsocketperm[[:space:]]+|# unixsocketperm |' "$conf"
+fi
+valid=false
+if systemctl restart redis-server && systemctl is-active --quiet redis-server; then
+    if [ "$mode" = socket ]; then socket_ready && valid=true
+    else redis_ping && valid=true; fi
+fi
+if [ "$valid" != true ]; then
+    cp -p "$conf_backup" "$conf"
+    config_pending=0
+    systemctl restart redis-server || true
+    if [ "$mode" = socket ]; then echo "错误: Redis Unix socket、目标用户组或 PING 验证失败，已恢复旧配置" >&2
+    else echo "错误: Redis TCP PING 验证失败，已恢复旧配置" >&2; fi
+    exit 1
+fi
+config_pending=0
+echo "Redis 已就绪（$mode）。"
