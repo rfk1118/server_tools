@@ -30,7 +30,7 @@ map_output="$(sort_modules_by_dependencies "${PARSED_MODULES[@]}")"
 [[ "$map_output" == $'create_user\ninstall_build_tools\nconfigure_ssh' ]]
 parse_selection 13
 map_output="$(sort_modules_by_dependencies "${PARSED_MODULES[@]}")"
-[[ "$map_output" == $'create_user\ninstall_build_tools\ninstall_redis\nrestore_redis_rdb' ]]
+[[ "$map_output" == restore_redis_rdb ]]
 if parse_selection cancel >/dev/null 2>&1; then exit 1; fi
 
 old_state_dir="$STATE_DIR"

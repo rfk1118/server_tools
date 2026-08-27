@@ -44,7 +44,6 @@ module_dependencies() {
         install_build_tools) printf '%s\n' create_user;;
         set_cpu_performance) printf '%s\n' install_cpupower;;
         configure_ssh) printf '%s\n' create_user install_build_tools;;
-        restore_redis_rdb) printf '%s\n' install_redis;;
         install_redis|install_node|install_rust) printf '%s\n' create_user install_build_tools;;
         install_golang) printf '%s\n' install_build_tools;;
     esac
